@@ -12,6 +12,7 @@
   const App = (global.DispatchApp = global.DispatchApp || {});
 
   const SYNC_CFG_KEY = 'virsa_ops_cloud_sync_v1';
+  const SETTINGS_TS_KEY = 'virsa_ops_settings_ts_v1';
   const DEFAULT_VIRSA_SHEETS_URL =
     'https://script.google.com/macros/s/AKfycbxpROCBmg_m892lKf-91ZMKSjyJDd-9RTIrCt4y_bNhikSWzsXixVrvY-NWmW9FptWXBA/exec';
   let pushTimer = null;
@@ -21,14 +22,109 @@
   let lifecycleBound = false;
   let onStatusChange = null;
 
-  function computeFingerprint(parcels, deletedIds, customCouriers) {
+  function getSettingsUpdatedAt() {
+    try {
+      return Number(global.localStorage.getItem(SETTINGS_TS_KEY) || 0) || 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function setSettingsUpdatedAt(ts) {
+    try {
+      global.localStorage.setItem(SETTINGS_TS_KEY, String(ts || Date.now()));
+    } catch (_) {}
+  }
+
+  function getLocalSharedSettings() {
+    const apiCfg = App.TrackingAPI ? App.TrackingAPI.loadConfig() : null;
+    const secCfg = App.Security ? App.Security.loadConfig() : null;
+    return {
+      updatedAt: getSettingsUpdatedAt(),
+      apiConfig: apiCfg
+        ? {
+            traxEnv: apiCfg.traxEnv || 'live',
+            traxApiKey: apiCfg.traxApiKey || '',
+            leopardsApiKey: apiCfg.leopardsApiKey || '',
+            leopardsApiPassword: apiCfg.leopardsApiPassword || '',
+            corsProxyUrl: apiCfg.corsProxyUrl || '',
+            autoMarkDeliveredOnSync: Boolean(apiCfg.autoMarkDeliveredOnSync)
+          }
+        : null,
+      securityConfig: secCfg
+        ? {
+            pinEnabled: Boolean(secCfg.pinEnabled),
+            pinSalt: secCfg.pinSalt || '',
+            pinHash: secCfg.pinHash || '',
+            autoLockMinutes: Number(secCfg.autoLockMinutes) || 0,
+            operatorName: secCfg.operatorName || 'VIRSA Station'
+          }
+        : null
+    };
+  }
+
+  function applyRemoteSharedSettings(remoteShared) {
+    if (!remoteShared || typeof remoteShared !== 'object') return false;
+    const localTs = getSettingsUpdatedAt();
+    const remoteTs = Number(remoteShared.updatedAt) || 0;
+
+    // Also pull if local device has no API keys yet while remote has them
+    const localApi = App.TrackingAPI ? App.TrackingAPI.loadConfig() : {};
+    const remoteApi = remoteShared.apiConfig || {};
+    const localHasKeys = Boolean(localApi.traxApiKey || localApi.leopardsApiKey);
+    const remoteHasKeys = Boolean(remoteApi.traxApiKey || remoteApi.leopardsApiKey);
+
+    if (remoteTs <= localTs && !(remoteHasKeys && !localHasKeys)) return false;
+
+    let changed = false;
+    if (remoteShared.apiConfig && App.TrackingAPI) {
+      App.TrackingAPI.saveConfig({
+        traxEnv: remoteApi.traxEnv || 'live',
+        traxApiKey: remoteApi.traxApiKey || '',
+        leopardsApiKey: remoteApi.leopardsApiKey || '',
+        leopardsApiPassword: remoteApi.leopardsApiPassword || '',
+        corsProxyUrl: remoteApi.corsProxyUrl || '',
+        autoMarkDeliveredOnSync: Boolean(remoteApi.autoMarkDeliveredOnSync)
+      });
+      changed = true;
+    }
+
+    if (remoteShared.securityConfig) {
+      const rSec = remoteShared.securityConfig;
+      const curSec = App.Security ? App.Security.loadConfig() : {};
+      const nextSec = Object.assign({}, curSec, {
+        pinEnabled: Boolean(rSec.pinEnabled),
+        pinSalt: rSec.pinSalt || '',
+        pinHash: rSec.pinHash || '',
+        autoLockMinutes: Number(rSec.autoLockMinutes) || 0,
+        operatorName: rSec.operatorName || curSec.operatorName || 'VIRSA Station'
+      });
+      try {
+        global.localStorage.setItem('virsa_ops_security_v1', JSON.stringify(nextSec));
+        changed = true;
+      } catch (_) {}
+    }
+
+    if (changed) {
+      setSettingsUpdatedAt(remoteTs || Date.now());
+    }
+    return changed;
+  }
+
+  function markSettingsChanged() {
+    setSettingsUpdatedAt(Date.now());
+    notifyLocalMutation();
+  }
+
+  function computeFingerprint(parcels, deletedIds, customCouriers, sharedSettings) {
     const pSig = (Array.isArray(parcels) ? parcels : [])
       .map((p) => `${p.trackingNumber}|${p.status}|${p.updatedAt || ''}|${p.returnedAt || ''}|${p.notes || ''}`)
       .sort()
       .join(';');
     const dSig = (Array.isArray(deletedIds) ? deletedIds : []).slice().sort().join(',');
     const cSig = (Array.isArray(customCouriers) ? customCouriers : []).map((c) => c.name).sort().join(',');
-    return `${pSig}#${dSig}#${cSig}`;
+    const sTs = sharedSettings ? String(sharedSettings.updatedAt || 0) : '0';
+    return `${pSig}#${dSig}#${cSig}#${sTs}`;
   }
 
   function defaultSyncConfig() {
@@ -152,6 +248,9 @@
             isSampleData: Boolean(data.state.isSampleData && localState.isSampleData)
           });
         }
+        if (data.sharedSettings) {
+          applyRemoteSharedSettings(data.sharedSettings);
+        }
         saveConfig({ lastDiskSaveAt: data.savedAt || new Date().toISOString() });
         return { ok: true, dbPath: data.dbPath || '' };
       } else {
@@ -170,7 +269,8 @@
       const payload = {
         app: 'MM-VIRSA-Ops',
         savedAt: new Date().toISOString(),
-        state: App.Storage.getState()
+        state: App.Storage.getState(),
+        sharedSettings: getLocalSharedSettings()
       };
       const res = await fetch('/api/db', {
         method: 'POST',
@@ -190,7 +290,7 @@
   // -------------------------------------------------------------------------
   // Layer 2: Two-Way Cloud Sync (Google Sheets Web App / Firebase RTDB)
   // -------------------------------------------------------------------------
-  async function cloudFetch(url, options) {
+  async function cloudFetchOnce(url, options) {
     const opts = options || {};
     const method = (opts.method || 'GET').toUpperCase();
     if (hasLocalDiskBackend()) {
@@ -214,6 +314,19 @@
     });
     const text = await res.text();
     return { ok: res.ok, status: res.status, text };
+  }
+
+  // Automatic single retry after 500ms for Google Apps Script cold-starts / transient redirects
+  async function cloudFetch(url, options) {
+    try {
+      const first = await cloudFetchOnce(url, options);
+      if (first.ok) return first;
+      await new Promise((r) => setTimeout(r, 500));
+      return await cloudFetchOnce(url, options);
+    } catch (err) {
+      await new Promise((r) => setTimeout(r, 500));
+      return await cloudFetchOnce(url, options);
+    }
   }
 
   function buildFirebaseUrl(baseUrl, secretToken) {
@@ -244,8 +357,17 @@
       return { ok: false, skipped: true, error: 'Cloud Sync is not enabled yet.' };
     }
     if (isSyncingNow) {
-      if (reason === 'auto_push' || reason === 'manual') hasPendingLocalChanges = true;
-      return { ok: false, skipped: true };
+      if (reason === 'manual') {
+        // Wait up to 4.5s for any in-flight poll to finish before running manual sync
+        const deadline = Date.now() + 4500;
+        while (isSyncingNow && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      }
+      if (isSyncingNow) {
+        if (reason === 'auto_push' || reason === 'manual') hasPendingLocalChanges = true;
+        return { ok: false, skipped: true };
+      }
     }
     isSyncingNow = true;
     const pushedOnEntry = hasPendingLocalChanges;
@@ -254,7 +376,8 @@
 
     try {
       const localState = App.Storage.getState();
-      const localFpBefore = computeFingerprint(localState.parcels, localState.deletedIds, localState.customCouriers);
+      const localShared = getLocalSharedSettings();
+      const localFpBefore = computeFingerprint(localState.parcels, localState.deletedIds, localState.customCouriers, localShared);
       let remoteState = null;
 
       // 1. PULL remote cloud state first
@@ -275,7 +398,7 @@
       }
 
       const remoteFp = remoteState
-        ? computeFingerprint(remoteState.parcels, remoteState.deletedIds, remoteState.customCouriers)
+        ? computeFingerprint(remoteState.parcels, remoteState.deletedIds, remoteState.customCouriers, remoteState.sharedSettings)
         : '';
 
       // 2. MERGE local + remote safely using updatedAt & deletedIds
@@ -293,10 +416,13 @@
 
       const mergedCouriers = mergeCouriers(localState.customCouriers, remoteState ? remoteState.customCouriers : []);
       const isStillSample = Boolean(localState.isSampleData && (!remoteState || remoteState.isSampleData));
-      const mergedFp = computeFingerprint(mergedParcels, mergedDeleted, mergedCouriers);
-      const localChanged = mergedFp !== localFpBefore;
+      const settingsChanged = remoteState && remoteState.sharedSettings ? applyRemoteSharedSettings(remoteState.sharedSettings) : false;
+      const mergedShared = getLocalSharedSettings();
+      const mergedFp = computeFingerprint(mergedParcels, mergedDeleted, mergedCouriers, mergedShared);
+      const localParcelsChanged = mergedFp !== localFpBefore;
+      const localChanged = localParcelsChanged || settingsChanged;
 
-      if (localChanged) {
+      if (localParcelsChanged) {
         App.Storage.applySyncedState({
           parcels: mergedParcels,
           customCouriers: mergedCouriers,
@@ -323,6 +449,7 @@
           isSampleData: isStillSample,
           customCouriers: mergedCouriers,
           deletedIds: mergedDeleted,
+          sharedSettings: mergedShared,
           parcels: mergedParcels
         };
 
@@ -434,6 +561,7 @@
     saveToLocalDisk,
     syncWithCloud,
     notifyLocalMutation,
+    markSettingsChanged,
     startAutoSyncLoop,
     isSyncing: () => isSyncingNow
   };
