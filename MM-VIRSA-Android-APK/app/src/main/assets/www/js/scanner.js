@@ -57,9 +57,19 @@
           max: Math.min(caps.zoom.max, 3.0)
         };
       }
-      // Enable continuous autofocus if camera supports it
+      // Boost live camera stream to highest supported HD/FHD resolution + continuous autofocus
+      const trackConstraints = {};
+      if (caps && caps.width && caps.width.max) {
+        trackConstraints.width = { ideal: Math.min(caps.width.max, 1920) };
+      }
+      if (caps && caps.height && caps.height.max) {
+        trackConstraints.height = { ideal: Math.min(caps.height.max, 1080) };
+      }
       if (caps && Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
-        await activeScanner.applyVideoConstraints({ advanced: [{ focusMode: 'continuous' }] });
+        trackConstraints.advanced = [{ focusMode: 'continuous' }];
+      }
+      if (Object.keys(trackConstraints).length > 0 && activeScanner.applyVideoConstraints) {
+        await activeScanner.applyVideoConstraints(trackConstraints);
       }
     } catch (_) {}
     return getCapabilities();
@@ -163,12 +173,11 @@
           const h = Math.min(110, Math.floor(viewfinderHeight * 0.62));
           return { width: Math.max(200, w), height: Math.max(72, h) };
         },
-        aspectRatio: 2.2,
         disableFlip: true,
         videoConstraints: {
           facingMode: { ideal: 'environment' },
-          width: { ideal: 1920, min: 1280 },
-          height: { ideal: 1080, min: 720 }
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
         }
       };
 
@@ -190,9 +199,18 @@
       try {
         await scanner.start({ facingMode: 'environment' }, config, handleSuccess, () => {});
       } catch (hdErr) {
-        // Fallback to standard constraints if device rejects 1080p constraints
-        delete config.videoConstraints;
-        await scanner.start({ facingMode: 'environment' }, config, handleSuccess, () => {});
+        // Fallback to 720p HD constraints before bare default
+        config.videoConstraints = {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        };
+        try {
+          await scanner.start({ facingMode: 'environment' }, config, handleSuccess, () => {});
+        } catch (_) {
+          delete config.videoConstraints;
+          await scanner.start({ facingMode: 'environment' }, config, handleSuccess, () => {});
+        }
       }
 
       const caps = await detectTrackCapabilities();
