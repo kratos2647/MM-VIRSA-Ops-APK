@@ -1805,6 +1805,7 @@
         leopardsApiPassword: $('inp-lcs-pass').value.trim(),
         autoMarkDeliveredOnSync: $('chk-auto-deliver').checked
       });
+      if (App.CloudSync && App.CloudSync.markSettingsChanged) App.CloudSync.markSettingsChanged();
       hydrateSettingsForms();
       renderApiAndSecurity();
       toast('Live API keys saved.');
@@ -1830,13 +1831,19 @@
       toast('Sync settings saved.');
       if (enabled && url) {
         const res = await App.CloudSync.syncWithCloud('manual');
+        if (res.skipped) return;
+        if (res.ok) hydrateSettingsForms();
         renderAll();
-        toast(res.ok ? `Cloud Sync active (${res.count} parcels)!` : `Sync failed: ${res.error}`, res.ok ? 'success' : 'error');
+        toast(res.ok ? `Cloud Sync active (${res.count} parcels)!` : `Sync failed: ${res.error || 'Unknown error'}`, res.ok ? 'success' : 'error');
       }
     });
 
     $('btn-cloud-sync-now').addEventListener('click', async () => {
       const res = await App.CloudSync.syncWithCloud('manual');
+      if (res.skipped) return;
+      if (res.ok && (!document.activeElement || !document.activeElement.closest('#api-config-form, #security-pin-form, #cloud-sync-form'))) {
+        hydrateSettingsForms();
+      }
       renderAll();
       toast(res.ok ? `Cloud synced (${res.count} parcels)` : res.error || 'Enable Cloud Sync first.', res.ok ? 'success' : 'warning');
     });
@@ -1903,6 +1910,7 @@
         const upd = App.Security.loadConfig();
         upd.operatorName = App.Security.sanitizeText(op, 40) || 'VIRSA Station';
         global.localStorage.setItem('virsa_ops_security_v1', JSON.stringify(upd));
+        if (App.CloudSync && App.CloudSync.markSettingsChanged) App.CloudSync.markSettingsChanged();
         hydrateSettingsForms();
         renderApiAndSecurity();
         return toast('Staff & security settings saved.');
@@ -1910,6 +1918,7 @@
       const saveFn = async () => {
         const r = await App.Security.setPin(pin, autoLock, op);
         if (!r.ok) return toast(r.error, 'error');
+        if (App.CloudSync && App.CloudSync.markSettingsChanged) App.CloudSync.markSettingsChanged();
         $('inp-sec-pin').value = '';
         hydrateSettingsForms();
         renderApiAndSecurity();
@@ -1922,6 +1931,7 @@
       const cur = global.prompt('Enter current Admin PIN to disable:');
       if (!cur) return;
       const r = await App.Security.disablePin(cur);
+      if (r.ok && App.CloudSync && App.CloudSync.markSettingsChanged) App.CloudSync.markSettingsChanged();
       toast(r.ok ? 'PIN Lock disabled.' : r.error, r.ok ? 'warning' : 'error');
       hydrateSettingsForms();
       renderApiAndSecurity();
@@ -1993,18 +2003,34 @@
 
     // Hydrate from permanent Local Disk Database when running in MM-VIRSA-Ops.exe
     if (App.CloudSync) {
+      const safeHydrate = () => {
+        if (!document.activeElement || !document.activeElement.closest('#api-config-form, #security-pin-form, #cloud-sync-form')) {
+          hydrateSettingsForms();
+        }
+      };
+
       const diskRes = await App.CloudSync.loadFromLocalDisk();
-      if (diskRes.ok) renderAll();
+      if (diskRes.ok) {
+        safeHydrate();
+        renderAll();
+      }
 
       App.CloudSync.startAutoSyncLoop((dataChanged) => {
-        if (dataChanged) renderAll();
-        else renderApiAndSecurity();
+        if (dataChanged) {
+          safeHydrate();
+          renderAll();
+        } else {
+          renderApiAndSecurity();
+        }
       });
 
       const sc = App.CloudSync.loadConfig();
       if (sc.enabled && sc.endpointUrl) {
         App.CloudSync.syncWithCloud('startup').then((r) => {
-          if (r.ok) renderAll();
+          if (r.ok) {
+            safeHydrate();
+            renderAll();
+          }
         });
       }
     }
